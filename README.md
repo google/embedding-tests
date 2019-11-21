@@ -1,3 +1,5 @@
+DISCLAIMER: This is not an officially supported Google product.
+
 # Analysis in Embeddings
 This repository contains implementations on word embedding and
 quick-thought sentence embedding models. 
