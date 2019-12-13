@@ -12,28 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-'''
-Evaluation code for the TREC dataset
-'''
 import numpy as np
-import os.path
+from data_handler import load_trec as load_data
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import LinearSVC
-
-DATA_DIR = '/path/to/data/'
 
 
-def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True,
-             loc=DATA_DIR):
+def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True, norm=False):
   """
   Run experiment
   k: number of CV folds
   test: whether to evaluate on test set
   """
   print 'Preparing data...'
-  traintext, testtext = load_data(loc)
+  traintext, testtext = load_data()
   train, train_labels = prepare_data(traintext)
   test, test_labels = prepare_data(testtext)
   train_labels = prepare_labels(train_labels)
@@ -41,18 +33,18 @@ def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True,
   # train, train_labels = shuffle(train, train_labels, random_state=seed)
 
   print 'Computing training skipthoughts...'
-  trainF = encoder.encode(train, verbose=False)
+  trainF = encoder.encode(train, verbose=False, norm=norm)
 
   if evalcv:
     print 'Running cross-validation...'
     interval = [2 ** t for t in range(0, 9, 1)]  # coarse-grained
     C = eval_kfold(trainF, train_labels, k=k, scan=interval, seed=seed)
   else:
-    C = 32
+    C = 128
 
   if evaltest:
     print 'Computing testing skipthoughts...'
-    testF = encoder.encode(test, verbose=False)
+    testF = encoder.encode(test, verbose=False, norm=norm)
 
     # scaler = StandardScaler()
     # trainF = scaler.fit_transform(trainF)
@@ -61,22 +53,9 @@ def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True,
     print 'Evaluating...'
     clf = LogisticRegression(C=C)
     clf.fit(trainF, train_labels)
-    # yhat = clf.predict(testF)
-    print 'Test accuracy: ' + str(clf.score(testF, test_labels))
-
-
-def load_data(loc=DATA_DIR):
-  """
-  Load the TREC question-type dataset
-  """
-  train, test = [], []
-  with open(os.path.join(loc, 'train_5500.label'), 'rb') as f:
-    for line in f:
-      train.append(line.strip())
-  with open(os.path.join(loc, 'TREC_10.label'), 'rb') as f:
-    for line in f:
-      test.append(line.strip())
-  return train, test
+    acc = clf.score(testF, test_labels)
+    print 'Test accuracy: ' + str(acc)
+    return acc
 
 
 def prepare_data(text):

@@ -22,6 +22,7 @@ from absl import app
 import os
 import numpy as np
 import tensorflow as tf
+import cPickle as pkl
 
 from sklearn.model_selection import train_test_split
 from gensim.matutils import unitvec
@@ -34,9 +35,10 @@ from data.common import MODEL_DIR
 from data.wiki9 import split_wiki9_articles, WIKI9Articles
 from utils.word_utils import load_tf_embedding, load_glove_model
 from utils.sent_utils import iterate_minibatches_indices
-from membership.utils import compute_adversarial_advantage, \
-  adversarial_advantage_from_trained
+from membership.utils import compute_adversarial_advantage
 from membership.models import LinearMetricModel
+from collections import Counter, defaultdict
+from multiprocessing import Process, Pipe
 
 
 flags.DEFINE_float('noise_multiplier', 0.,
@@ -47,8 +49,8 @@ flags.DEFINE_float('train_size', 0.2, 'Ratio of data for training the '
 flags.DEFINE_integer('epoch', 4, 'Load model trained this epoch')
 flags.DEFINE_integer('microbatches', 128, 'microbatches')
 flags.DEFINE_integer('exp_id', 0, 'Experiment trial number')
-flags.DEFINE_integer('n_jobs', 4, 'number of CPU cores for parallel '
-                                  'collecting metrics')
+flags.DEFINE_integer('n_jobs', 16, 'number of CPU cores for parallel '
+                                   'collecting metrics')
 flags.DEFINE_integer('window', 3, 'window size for a context of words')
 flags.DEFINE_integer('freq_min', 80,
                      'use word frequency rank above this percentile, '
@@ -58,12 +60,15 @@ flags.DEFINE_string('metric', 'cosine', 'Metric to use for cosine similarity')
 flags.DEFINE_string('model', 'w2v', 'Word embedding model')
 flags.DEFINE_string('save_dir', os.path.join(MODEL_DIR, 'w2v'),
                     'Model directory for embedding model')
+flags.DEFINE_boolean('idf', False,
+                     'Weight score by inverse document frequency')
 flags.DEFINE_boolean('ctx_level', False,
                      'Context level or article level inference')
 flags.DEFINE_boolean('learning', False,
                      'Whether to learning a metric model')
 
 FLAGS = flags.FLAGS
+
 tf.logging.set_verbosity(tf.logging.FATAL)
 
 
@@ -103,6 +108,7 @@ def get_all_contexts(docs, model, thresh, window=3):
         context_pair = [(vocab[word].index, vocab[neighbor].index)
                         for neighbor in context]
         doc_ctx.append(np.asarray(context_pair, dtype=np.int64))
+        # all_docs_ctx.append(np.asarray(context_pair, dtype=np.int64))
 
     if len(doc_ctx) > 0:
       all_docs_ctx.append(doc_ctx)
@@ -110,11 +116,11 @@ def get_all_contexts(docs, model, thresh, window=3):
   return all_docs_ctx
 
 
-def split_docs(docs):
+def split_docs(docs, n_jobs):
   n_docs = len(docs)
-  n_docs_per_job = n_docs // FLAGS.n_jobs + 1
+  n_docs_per_job = n_docs // n_jobs + 1
   splits = []
-  for i in range(FLAGS.n_jobs):
+  for i in range(n_jobs):
     splits.append(docs[i * n_docs_per_job: (i + 1) * n_docs_per_job])
   return splits
 
@@ -178,9 +184,9 @@ def trained_metric(exp_id=0, n_jobs=1, freqs=(80, 100), window=3,
 
   if n_jobs > 1:
     member_job_ctxs = Parallel(n_jobs)(delayed(get_all_contexts)(
-      ds, model, thresh, window) for ds in split_docs(train_docs))
+      ds, model, thresh, window) for ds in split_docs(train_docs, n_jobs))
     nonmember_job_ctxs = Parallel(n_jobs)(delayed(get_all_contexts)(
-      ds, model, thresh, window) for ds in split_docs(test_docs))
+      ds, model, thresh, window) for ds in split_docs(test_docs, n_jobs))
     member_ctxs = [ctxs for job_ctxs in member_job_ctxs
                    for ctxs in job_ctxs]
     nonmember_ctxs = [ctxs for job_ctxs in nonmember_job_ctxs
@@ -255,7 +261,7 @@ def trained_metric(exp_id=0, n_jobs=1, freqs=(80, 100), window=3,
       train_loss = 0
 
       for batch_idx in iterate_minibatches_indices(
-          len(train_y), batch_size=512, shuffle=True):
+            len(train_y), batch_size=512, shuffle=True):
         feed = {inputs_a: train_x[batch_idx][:, 0],
                 inputs_b: train_x[batch_idx][:, 1],
                 labels: train_y[batch_idx]}
@@ -272,7 +278,7 @@ def trained_metric(exp_id=0, n_jobs=1, freqs=(80, 100), window=3,
 
 
 def metrics_rare_words(docs, model, thresh, window=3, metric='cosine',
-                       ctx_level=True):
+                       ctx_level=True, idf_dict=None, pipe=None):
   vocab = model.wv.vocab
 
   all_words = sorted(vocab.keys())
@@ -317,21 +323,80 @@ def metrics_rare_words(docs, model, thresh, window=3, metric='cosine',
         else:
           raise ValueError('No such metric: {}'.format(metric))
 
+        if idf_dict is not None:
+          idf_weights = [idf_dict[neighbor] for neighbor in context]
+          sum_weight = sum(idf_weights) / len(idf_weights)
+          scores = [s * w / sum_weight for s, w in zip(scores, idf_weights)]
+
         doc_metrics += scores
         metrics.append(scores)
 
     if len(doc_metrics) > 0:
       all_docs_metrics.append(doc_metrics)
 
-  if ctx_level:
-    return np.asarray(metrics)
+  result = np.asarray(metrics) if ctx_level else all_docs_metrics
+  if pipe:
+    pipe.send(result)
   else:
-    return all_docs_metrics
+    return result
+
+
+def get_idf_count(docs):
+  idf_count = Counter()
+  for text in WIKI9Articles(docs, verbose=1):
+    unique_words = set(text)
+    idf_count.update(unique_words)
+  return idf_count
+
+
+def get_idf_dict(docs, n_jobs=16):
+  num_docs = len(docs)
+  save_path = './data/wiki9_idf_count.pkl'
+
+  if os.path.exists(save_path):
+    with open(save_path, 'rb') as f:
+      idf_count = pkl.load(f)
+  else:
+    idf_counts = Parallel(n_jobs)(delayed(get_idf_count)(ds)
+                                  for ds in split_docs(docs, n_jobs))
+    idf_count = Counter()
+    for count in idf_counts:
+      idf_count.update(count)
+
+    with open(save_path, 'wb') as f:
+      pkl.dump(idf_count, f, -1)
+
+  print('Compute idf dict...')
+  idf_dict = defaultdict(lambda: np.log((num_docs + 1) / 1))
+  idf_dict.update({idx: np.log((num_docs + 1) / (c + 1)) for (idx, c) in
+                   idf_count.items()})
+  return idf_dict
+
+
+def run_normal_parallel(data, fn, n_jobs, *args):
+  workers = []
+  pipes = []
+  for i in range(n_jobs):
+    parent, child = Pipe()
+    worker = Process(target=fn, args=(data[i], ) + args + (child, ))
+    pipes.append(parent)
+    worker.start()
+
+  result = []
+  for pipe in pipes:
+    result.append(pipe.recv())
+
+  for worker in workers:
+    worker.terminate()
+
+  return result
 
 
 def find_signal(exp_id=0, n_jobs=1, freqs=(80, 100), window=3, metric='cosine',
                 ctx_level=True, emb_model='ft'):
   train_docs, test_docs = split_wiki9_articles(exp_id)
+  idf_dict = get_idf_dict(train_docs + test_docs) if FLAGS.idf else None
+
   save_dir = FLAGS.save_dir
 
   model_name = 'wiki9_{}_{}.model'.format(emb_model, FLAGS.exp_id)
@@ -354,42 +419,39 @@ def find_signal(exp_id=0, n_jobs=1, freqs=(80, 100), window=3, metric='cosine',
 
   vocab_size = len(model.wv.vocab)
   thresh = (int(vocab_size * freqs[0] / 100), int(vocab_size * freqs[1] / 100))
-
   if n_jobs > 1:
-    train_metrics = Parallel(n_jobs)(delayed(metrics_rare_words)(
-      ds, model, thresh, window, metric, ctx_level)
-                                     for ds in split_docs(train_docs))
-    test_metrics = Parallel(n_jobs)(delayed(metrics_rare_words)(
-      ds, model, thresh, window, metric, ctx_level)
-                                    for ds in split_docs(test_docs))
-
+    args = model, thresh, window, metric, ctx_level, idf_dict
+    train_metrics = run_normal_parallel(
+      split_docs(train_docs, n_jobs),  metrics_rare_words, n_jobs, *args)
     train_metrics = np.concatenate(train_metrics)
+    test_metrics = run_normal_parallel(
+      split_docs(test_docs, n_jobs), metrics_rare_words, n_jobs, *args)
     test_metrics = np.concatenate(test_metrics)
   else:
     train_metrics = metrics_rare_words(train_docs, model, thresh, window,
-                                       metric, ctx_level)
+                                       metric, ctx_level, idf_dict)
     test_metrics = metrics_rare_words(test_docs, model, thresh, window,
-                                      metric, ctx_level)
+                                      metric, ctx_level, idf_dict)
 
   compute_adversarial_advantage([np.mean(m) for m in train_metrics],
                                 [np.mean(m) for m in test_metrics])
 
-  if ctx_level:
-    data = (train_metrics, test_metrics)
-    adversarial_advantage_from_trained(data, histogram=False)
-  else:
-    range_map = {
-      'cosine': (-1, 1),
-    }
-    if metric in range_map:
-      metric_range = range_map[metric]
-    else:
-      all_metrics = np.concatenate([np.concatenate(train_metrics),
-                                    np.concatenate(test_metrics)])
-      metric_range = (np.min(all_metrics), np.max(all_metrics))
-
-    data = (train_metrics, test_metrics)
-    adversarial_advantage_from_trained(data, metric_range)
+  # if ctx_level:
+  #   data = (train_metrics, test_metrics)
+  #   adversarial_advantage_from_trained(data, histogram=False)
+  # else:
+  #   range_map = {
+  #     'cosine': (-1, 1),
+  #   }
+  #   if metric in range_map:
+  #     metric_range = range_map[metric]
+  #   else:
+  #     all_metrics = np.concatenate([np.concatenate(train_metrics),
+  #                                   np.concatenate(test_metrics)])
+  #     metric_range = (np.min(all_metrics), np.max(all_metrics))
+  #
+  #   data = (train_metrics, test_metrics)
+  #   adversarial_advantage_from_trained(data, metric_range)
 
 
 def main(unused_argv):

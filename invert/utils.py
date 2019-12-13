@@ -24,7 +24,7 @@ def sents_to_labels(sents, label_thresh=0):
   labels = []
   for s in sents:
     label = s[s > label_thresh]
-    assert len(label) > 0
+    assert len(label) > 0, s
     labels.append(label)
   return np.asarray(labels)
 
@@ -103,18 +103,19 @@ def multi_hot(ind, depth):
   return tf.cast(multi_hots, tf.float32)
 
 
-def tp_fp_fn_metrics_np(y_pred, y_true, rtn_match=False, rare_thresh=2500):
+def tp_fp_fn_metrics_np(y_pred, y_true, rtn_match=False, rare_thresh=0):
   tp, fp, fn = 0., 0., 0.
   matched = {}
   i = 0
   for p, t in zip(y_pred, y_true):
     t = np.unique(t[t > 0])
     p = np.unique(p[p > 0])
-
-    matched_rare = np.intersect1d(t[t > rare_thresh], p[p > rare_thresh])
     matched_all = np.intersect1d(t, p)
-    if len(matched_rare) >= 1 and len(matched_all) >= 2:
-      matched[i] = matched_all
+
+    if rtn_match:
+      matched_rare = np.intersect1d(t[t > rare_thresh], p[p > rare_thresh])
+      if len(matched_rare) >= 1:
+        matched[i] = matched_all
 
     tp += len(matched_all)  # predicted and in label
     fp += len(np.setdiff1d(p, t))  # predicted but not in label
@@ -132,3 +133,62 @@ def exact_match(y_pred, y_true):
   equal = np.all(y_pred == y_true, axis=1)
   matched = np.arange(len(y_pred))[equal]
   return matched
+
+
+def sinkhorn(log_alpha, n_iters=5):
+  n = tf.shape(log_alpha)[1]
+  log_alpha = tf.reshape(log_alpha, [-1, n, n])
+
+  for _ in range(n_iters):
+    log_alpha -= tf.reshape(tf.reduce_logsumexp(log_alpha, axis=2), [-1, n, 1])
+    log_alpha -= tf.reshape(tf.reduce_logsumexp(log_alpha, axis=1), [-1, 1, n])
+  return tf.exp(log_alpha)
+
+
+def continuous_topk(x, k, t=1.0, epsilon=1e-7, unroll=True):
+  if unroll:
+    logits_list = []
+    onehot_approx_i = tf.zeros_like(x)
+    x_i = x
+    for _ in range(k):
+      khot_mask = tf.maximum(1.0 - onehot_approx_i, epsilon)
+      x_i += tf.log(khot_mask)
+      onehot_approx_i = tf.nn.softmax(x_i / t, axis=-1)
+      logits_list.append(tf.expand_dims(x_i, axis=1))
+    logits_list = tf.concat(logits_list, axis=1)
+  else:
+    b, e = x.shape.as_list()
+    logits_list = tf.zeros((b, 0, e))
+
+    def cond_fn(i, x_i, onehot_approx_i, logits_list_i):
+      return tf.less(i, k)
+
+    def body_fn(i, x_i, onehot_approx_i, logits_list_i):
+      khot_mask = tf.maximum(1.0 - onehot_approx_i, epsilon)
+      x_i += tf.log(khot_mask)
+      onehot_approx_i = tf.nn.softmax(x_i / t, axis=-1)
+      logits_list_i = tf.concat([logits_list_i, tf.expand_dims(x_i, 1)], 1)
+      return i + 1, x_i, onehot_approx_i, logits_list_i
+
+    _, _, _, khot_list = tf.while_loop(
+      cond_fn, body_fn,
+      [tf.constant(0), x, tf.zeros_like(x), logits_list],
+      [tf.TensorShape([]), x.get_shape(), x.get_shape(),
+       tf.TensorShape([b, None, e])]
+    )
+  return logits_list
+
+
+def continuous_topk_v2(x, k, t=1.0, inf=1e7):
+  prob_lists = []
+  # x_i = x
+  v = x.shape.as_list()[-1]
+  onehot_i = tf.zeros((x.shape.as_list()[0], v))
+
+  for i in range(k):
+    x_i = x[:, i] + onehot_i * (-inf)
+    onehot_approx_i = tf.nn.softmax(x_i / t, axis=-1)
+    onehot_i = tf.one_hot(tf.argmax(onehot_approx_i, axis=-1), v)
+    # x_i = x_i + onehot_i * (-inf)
+    prob_lists.append(tf.expand_dims(onehot_approx_i, axis=1))
+  return tf.concat(prob_lists, axis=1)

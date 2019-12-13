@@ -15,42 +15,35 @@
 # Evaluation for MSRP
 
 import numpy as np
-
-from nltk.tokenize import word_tokenize
-import os.path
+from data_handler import load_msrp as load_data
 from sklearn.model_selection import KFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score as f1
 
-DATA_DIR = '/path/to/data/'
-
 
 def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True,
-             use_feats=True, loc=DATA_DIR):
+             use_feats=True):
   """
   Run experiment
   k: number of CV folds
   test: whether to evaluate on test set
   """
-  print 'Preparing data...'
-  traintext, testtext, labels = load_data(loc)
+  traintext, testtext, labels = load_data()
 
-  print 'Computing training skipthoughts...'
-  trainA = encoder.encode(traintext[0], verbose=False)
-  trainB = encoder.encode(traintext[1], verbose=False)
+  trainA = encoder.encode(traintext[0], verbose=False, norm=True)
+  trainB = encoder.encode(traintext[1], verbose=False, norm=True)
 
   if evalcv:
     print 'Running cross-validation...'
     C = eval_kfold(trainA, trainB, traintext, labels[0], shuffle=True, k=k,
                    seed=seed, use_feats=use_feats)
+  else:
+    C = 4
 
   if evaltest:
-    if not evalcv:
-      C = 4  # Best parameter found from CV (combine-skip with use_feats=True)
-
     print 'Computing testing skipthoughts...'
-    testA = encoder.encode(testtext[0], verbose=False)
-    testB = encoder.encode(testtext[1], verbose=False)
+    testA = encoder.encode(testtext[0], verbose=False, norm=True)
+    testB = encoder.encode(testtext[1], verbose=False, norm=True)
 
     if use_feats:
       train_features = np.c_[
@@ -66,39 +59,11 @@ def evaluate(encoder, k=10, seed=1234, evalcv=False, evaltest=True,
     clf = LogisticRegression(C=C)
     clf.fit(train_features, labels[0])
     yhat = clf.predict(test_features)
-    print 'Test accuracy: ' + str(clf.score(test_features, labels[1]))
-    print 'Test F1: ' + str(f1(labels[1], yhat))
-
-
-def load_data(loc=DATA_DIR):
-  """
-  Load MSRP dataset
-  """
-  trainloc = os.path.join(loc, 'msr_paraphrase_train.txt')
-  testloc = os.path.join(loc, 'msr_paraphrase_test.txt')
-
-  trainA, trainB, testA, testB = [], [], [], []
-  trainS, devS, testS = [], [], []
-
-  f = open(trainloc, 'rb')
-  for line in f:
-    text = line.strip().split('\t')
-    trainA.append(' '.join(word_tokenize(text[3])))
-    trainB.append(' '.join(word_tokenize(text[4])))
-    trainS.append(text[0])
-  f.close()
-  f = open(testloc, 'rb')
-  for line in f:
-    text = line.strip().split('\t')
-    testA.append(' '.join(word_tokenize(text[3])))
-    testB.append(' '.join(word_tokenize(text[4])))
-    testS.append(text[0])
-  f.close()
-
-  trainS = [int(s) for s in trainS[1:]]
-  testS = [int(s) for s in testS[1:]]
-
-  return [trainA[1:], trainB[1:]], [testA[1:], testB[1:]], [trainS, testS]
+    acc = clf.score(test_features, labels[1])
+    f1_score = f1(labels[1], yhat)
+    print 'Test accuracy: ' + str(acc)
+    print 'Test F1: ' + str(f1_score)
+    return acc, f1_score
 
 
 def is_number(s):
@@ -170,10 +135,8 @@ def eval_kfold(A, B, train, labels, shuffle=True, k=10, seed=1234,
   scores = []
 
   for s in scan:
-
     scanscores = []
-
-    for train, test in kf:
+    for train, test in kf.split(features):
       # Split data
       X_train = features[train]
       y_train = labels[train]
@@ -186,7 +149,6 @@ def eval_kfold(A, B, train, labels, shuffle=True, k=10, seed=1234,
       yhat = clf.predict(X_test)
       fscore = f1(y_test, yhat)
       scanscores.append(fscore)
-      print (s, fscore)
 
     # Append mean score
     scores.append(np.mean(scanscores))
@@ -194,7 +156,6 @@ def eval_kfold(A, B, train, labels, shuffle=True, k=10, seed=1234,
 
   # Get the index of the best score
   s_ind = np.argmax(scores)
-  s = scan[s_ind]
-  print scores
-  print s
+  s = scan[int(s_ind)]
+  print(s)
   return s
