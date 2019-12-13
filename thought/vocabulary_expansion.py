@@ -17,6 +17,8 @@ from __future__ import division
 from __future__ import print_function
 
 from gensim.models import KeyedVectors
+from data.common import WORD_EMB_PATH
+from data.bookcorpus import VOCAB_PATH
 import collections
 import os
 import tqdm
@@ -25,10 +27,9 @@ import sklearn.linear_model
 import tensorflow as tf
 
 
-EMB_PATH = '/home/congzheng/memorization/data/'
-GLOVE_EMBEDDING_PATH = EMB_PATH + 'glove.840B.300d_gensim.txt'
-W2V_EMBEDDING_PATH = EMB_PATH + 'GoogleNews-vectors-negative300.bin'
-VOCAB_PATH = '/mnt/nfs/bookcorpus/data/word_count0'
+GLOVE_EMBEDDING_PATH = WORD_EMB_PATH + 'glove.840B.300d_gensim.txt'
+W2V_EMBEDDING_PATH = WORD_EMB_PATH + 'GoogleNews-vectors-negative300.bin'
+VOCAB_PATH = VOCAB_PATH.format(0)
 
 
 def _expand_vocabulary(thought_emb, vocab, word2vec):
@@ -84,13 +85,15 @@ def load_pretrained_word_embedding(glove=False):
   print("loading pretrained embedding from disk...")
   word_emb_model = KeyedVectors.load_word2vec_format(
       GLOVE_EMBEDDING_PATH if glove else W2V_EMBEDDING_PATH,
-      binary=not glove, limit=1000000)
+      binary=not glove, limit=1500000)
   return word_emb_model
 
 
-def expand_vocabulary(model_dir, vocab=None, use_glove=False, save=False):
+def expand_vocabulary(model_dir, vocab=None, emb_name="emb_in",
+                      use_glove=False, save=False):
+
   # Load the skip-thoughts embeddings and vocabulary.
-  thought_emb = tf.train.load_variable(model_dir, "emb_in")
+  thought_emb = tf.train.load_variable(model_dir, emb_name)
 
   if vocab is None:
     vocab = load_bookcorpus_vocab()
@@ -125,3 +128,4 @@ def expand_vocabulary(model_dir, vocab=None, use_glove=False, save=False):
 
   embeddings = np.vstack([thought_emb[0], embeddings])
   return vocab, embeddings
+

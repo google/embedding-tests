@@ -16,9 +16,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import random
 import numpy as np
 import os
+import random
 
 DATA_DIR = '/path/to/data/'
 MODEL_DIR = '/path/to/model/'

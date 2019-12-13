@@ -45,15 +45,15 @@ flip_gradient = FlipGradientBuilder()
 def build_model(num_attr, hidden_size=0):
   if hidden_size == 0:
     model = tf.keras.Sequential([
-      tf.keras.layers.Dropout(0.25),
+      tf.keras.layers.Dropout(0.2),
       tf.keras.layers.Dense(num_attr, name='output')
     ])
   else:
     model = tf.keras.Sequential([
-      tf.keras.layers.Dropout(0.25),
+      tf.keras.layers.Dropout(0.2),
       tf.keras.layers.Dense(hidden_size, activation=tf.nn.relu,
                             name='fc'),
-      tf.keras.layers.Dropout(0.25),
+      tf.keras.layers.Dropout(0.2),
       tf.keras.layers.Dense(num_attr, name='output')
     ])
   model_fn = lambda x, training: model.apply(x, training=training)

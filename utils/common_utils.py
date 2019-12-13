@@ -33,6 +33,12 @@ def load_trained_variable(model_path, name):
   return data
 
 
+def sharpen(p_model_y, temp):
+  p_target = tf.pow(p_model_y, 1. / temp)
+  p_target /= tf.reduce_sum(p_target, axis=-1, keep_dims=True)
+  return p_target
+
+
 def make_parallel(fn, num_gpus, **kwargs):
   in_splits = {}
   for k, v in kwargs.items():

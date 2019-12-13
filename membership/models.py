@@ -16,6 +16,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import numpy as np
 import tensorflow as tf
 
 
@@ -46,27 +47,109 @@ class OuterMetricModel(object):
     return tf.reshape(logits, [-1])
 
 
+def _ortho_weight(shape, dtype=tf.float32):
+  W = np.random.normal(size=shape)
+  u, s, v = np.linalg.svd(W)
+  return tf.convert_to_tensor(u.astype('float32'), dtype)
+
+
 class BilinearMetricModel(object):
   def __init__(self, encoder_dim):
-    self.weight = tf.get_variable(
-      "bilinear_w", shape=(encoder_dim, encoder_dim))
+    shape = (encoder_dim, encoder_dim)
+    self.weight = tf.Variable(initial_value=_ortho_weight(shape),
+                              name="bilinear_kernel", shape=shape)
+    self.dropout = tf.keras.layers.Dropout(0.2)
 
-  def forward(self, embed_a, embed_b):
+  def forward(self, embed_a, embed_b, training):
+    embed_a = self.dropout(embed_a, training=training)
+    embed_b = self.dropout(embed_b, training=training)
     aw = tf.matmul(embed_a, self.weight)  # B x e
     logits = tf.reduce_sum(tf.multiply(aw, embed_b), axis=1)
     return logits
 
 
 class LinearMetricModel(object):
-  def __init__(self, encoder_dim):
+  def __init__(self, encoder_dim, tie=False):
     self.fc = tf.keras.layers.Dense(encoder_dim, name='linear',
+                                    activation=None)
+    self.fc2 = self.fc if tie else tf.keras.layers.Dense(
+        encoder_dim, name='linear2', activation=None)
+
+    self.dropout = tf.keras.layers.Dropout(0.2)
+
+  def forward(self, embed_a, embed_b, training):
+    a = self.fc(embed_a)
+    a = self.dropout(a, training=training)
+
+    b = self.fc2(embed_b)
+    b = self.dropout(b, training=training)
+
+    logits = tf.reduce_sum(tf.multiply(a, b), axis=1)
+    return tf.reshape(logits, [-1])
+
+
+class DeepSetModel(object):
+  def __init__(self, set_dim):
+    self.upsample = tf.keras.layers.Conv1D(filters=128, kernel_size=3,
+                                           strides=1, name='upsample')
+
+    self.phi = tf.keras.models.Sequential([
+      tf.keras.layers.Dense(set_dim, name='phi1', activation=tf.nn.elu),
+      tf.keras.layers.Dense(set_dim, name='phi2', activation=None),
+    ])
+
+    self.rho = tf.keras.models.Sequential([
+      tf.keras.layers.Dense(set_dim, name='rho1', activation=tf.nn.elu),
+      tf.keras.layers.Dense(1, name='rho2', activation=None),
+    ])
+    self.dropout = tf.keras.layers.Dropout(0.2)
+
+  def forward(self, embed_a, embed_b, training):
+    x = tf.multiply(embed_a, embed_b)
+    x = tf.expand_dims(x, 2)
+    x = self.upsample(x)
+    x = self.dropout(x, training=training)
+
+    phi_x = self.phi(x)
+    phi_x = self.dropout(phi_x, training=training)
+
+    phi_x = tf.reduce_sum(phi_x, axis=1)
+    logits = self.rho(phi_x)
+    return tf.reshape(logits, [-1])
+
+
+class RBFMetricModel(object):
+  def __init__(self, encoder_dim):
+    if encoder_dim > 0:
+      self.fc = tf.keras.layers.Dense(encoder_dim, name='linear',
+                                      use_bias=False)
+    else:
+      self.fc = lambda x: x
+
+  def forward(self, embed_a, embed_b):
+    a = self.fc(embed_a)
+    b = self.fc(embed_b)
+    logits = tf.reduce_sum(tf.multiply(a, b), axis=1)
+    return tf.reshape(logits, [-1])
+
+
+class CovMetricModel(object):
+  def __init__(self, encoder_dim):
+    self.fc = tf.keras.layers.Dense(encoder_dim // 2, name='linear',
                                     use_bias=False)
+
+    self.encoder_dim = encoder_dim // 2
 
   def forward(self, embed_a, embed_b):
     a = self.fc.apply(embed_a)
     b = self.fc.apply(embed_b)
-    logits = tf.reduce_sum(tf.multiply(a, b), axis=1)
-    return tf.reshape(logits, [-1])
+    covar = tf.matmul(
+      tf.expand_dims(a - tf.reduce_mean(a, axis=1, keepdims=True), 2),
+      tf.expand_dims(b - tf.reduce_mean(b, axis=1, keepdims=True), 1))
+
+    covar /= tf.constant(self.encoder_dim, dtype=tf.float32)
+    logits = tf.norm(covar, ord='fro', axis=[-2, -1])
+    return logits
 
 
 class DistanceMetricModel(object):

@@ -103,7 +103,7 @@ class Attention(object):
 
     # Run the combined outputs through another linear projection layer.
     attention_output = self.output_dense_layer(attention_output)
-    return attention_output
+    return attention_output, weights
 
 
 class SelfAttention(Attention):
@@ -114,7 +114,8 @@ class SelfAttention(Attention):
 
 
 class FeedForwardNetwork(object):
-  def __init__(self, hidden_size, filter_size, relu_dropout, train):
+  def __init__(self, hidden_size, filter_size, relu_dropout, train,
+               name_prefix=""):
     super(FeedForwardNetwork, self).__init__()
     self.hidden_size = hidden_size
     self.filter_size = filter_size
@@ -122,10 +123,11 @@ class FeedForwardNetwork(object):
     self.train = train
 
     self.filter_dense_layer = tf.keras.layers.Dense(
-      filter_size, use_bias=True, activation=tf.nn.relu, name="filter_layer")
+      filter_size, use_bias=True, activation=tf.nn.relu,
+      name=name_prefix + "filter_layer")
 
     self.output_dense_layer = tf.keras.layers.Dense(
-      hidden_size, use_bias=True, name="output_layer")
+      hidden_size, use_bias=True, name=name_prefix + "output_layer")
 
   def forward(self, x, padding=None):
     # Retrieve dynamically known shapes
@@ -193,10 +195,18 @@ class PrePostProcessingWrapper(object):
     y = self.layer_norm.forward(x)
     # Get layer output
     y = self.layer.forward(y, *args, **kwargs)
+    if isinstance(self.layer, SelfAttention):
+      y, a = y
+    else:
+      a = None
     # Postprocessing: apply dropout and residual connection
     if self.train:
       y = tf.nn.dropout(y, 1 - self.postprocess_dropout)
-    return x + y
+
+    if a is None:
+      return x + y
+    else:
+      return x + y, a
 
 
 class TransformerBlock(object):
@@ -205,6 +215,9 @@ class TransformerBlock(object):
                layer_postprocess_dropout=0.1, num_layer=2,
                train=True, name_prefix=""):
     self.layers = []
+    self.outputs = []
+    self.attention_matrices = []
+
     for i in range(num_layer):
       with tf.variable_scope("self_attention_{}".format(i)):
         attn = SelfAttention(hidden_size, num_heads, attention_dropout, train,
@@ -212,7 +225,8 @@ class TransformerBlock(object):
         attn = PrePostProcessingWrapper(attn, hidden_size,
                                         layer_postprocess_dropout)
       with tf.variable_scope("ffn_{}".format(i)):
-        ffn = FeedForwardNetwork(hidden_size, filter_size, relu_dropout, train)
+        ffn = FeedForwardNetwork(hidden_size, filter_size, relu_dropout, train,
+                                 name_prefix)
         ffn = PrePostProcessingWrapper(ffn, hidden_size,
                                        layer_postprocess_dropout)
       self.layers.append([attn, ffn])
@@ -227,21 +241,26 @@ class TransformerBlock(object):
     attention_bias = get_padding_bias(masks)
     inputs_padding = get_padding(masks)
     encoder_inputs = inputs
+    masks = tf.cast(masks, tf.float32)
+
+    def mean_pool(oo):
+      oo = oo * tf.reshape(masks, [batch_size, length, 1])
+      ss = tf.reduce_sum(oo, axis=1)
+      ll = tf.reduce_sum(masks, 1, keepdims=True)
+      return ss / ll
+
     for layer in self.layers:
       attn, ffn = layer
-      encoder_inputs = attn.forward(encoder_inputs, attention_bias, None)
+      encoder_inputs, a = attn.forward(encoder_inputs, attention_bias, None)
+      self.outputs.append(mean_pool(encoder_inputs))
+      self.attention_matrices.append(a)
       encoder_inputs = ffn.forward(encoder_inputs, inputs_padding)
 
     outputs = self.output_normalization.forward(encoder_inputs)
-    masks = tf.cast(masks, tf.float32)
-    outputs = outputs * tf.reshape(masks, [batch_size, length, 1])
     if pool:
-      # mean-pooling
-      outputs_sum = tf.reduce_sum(outputs, axis=1)
-      lengths = tf.reduce_sum(masks, 1, keepdims=True)
-      return outputs_sum / lengths
-    else:
-      return outputs
+      outputs = mean_pool(outputs)
+
+    return outputs
 
 
 def get_padding_bias(x):

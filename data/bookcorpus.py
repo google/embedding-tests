@@ -18,10 +18,16 @@ from __future__ import print_function
 from nltk.tokenize import sent_tokenize, word_tokenize
 from joblib import Parallel, delayed
 from collections import Counter, defaultdict
-from common import DATA_DIR, GLOVE_EMBEDDING_PATH, W2V_EMBEDDING_PATH, gen_seed
 import unidecode
 import numpy as np
-import cPickle as pkl
+from common import DATA_DIR, GLOVE_EMBEDDING_PATH, W2V_EMBEDDING_PATH, gen_seed
+
+try:
+  import cPickle as pkl
+except ImportError:
+  import pickle as pkl
+
+import keras_preprocessing.text
 import smart_open
 import os
 import re
@@ -36,6 +42,7 @@ BOOKCORPUS_PROCESSED_DIR = DATA_DIR + 'bookcorpus/processed_txts/'
 BOOKCORPUS_DATA_DIR = DATA_DIR + 'bookcorpus/data/'
 BOOKCORPUS_NP_DIR = DATA_DIR + 'bookcorpus/numpy/'
 BOOKCORPUS_AUTHOR_DIR = DATA_DIR + 'bookcorpus/author/'
+VOCAB_PATH = os.path.join(BOOKCORPUS_DATA_DIR, 'word_count{}')
 
 if not os.path.exists(BOOKCORPUS_PROCESSED_DIR):
   os.makedirs(BOOKCORPUS_PROCESSED_DIR)
@@ -157,8 +164,7 @@ def build_vocabulary(exp_id=0, n_jobs=48, vocab_size=50000,
     with open(vocab_path, 'wb') as f:
       pkl.dump(vocab, f, -1)
 
-    with open(os.path.join(BOOKCORPUS_DATA_DIR, 'word_count{}'.format(exp_id)),
-              'w') as f:
+    with open(VOCAB_PATH.format(exp_id), 'w') as f:
       for w, c, in wordcount:
         f.write('{}\t{}\n'.format(w.encode("utf-8"), c))
 
@@ -388,8 +394,10 @@ def preprocess_pipeline(n_jobs=48, start_from_raw=False):
   save_existed_word_embedding(glove=False)
 
 
-def filter_tokenized_file(filename, min_len=10, max_len=50):
+def filter_tokenized_file(filename, vocab, min_len=5):
   sents = []
+  filters = {'copyright', 'chapter', 'edition', 'license', 'licensed',
+             'published'}
   with smart_open.open(os.path.join(BOOKCORPUS_PROCESSED_DIR, filename),
                        encoding='utf-8') as f:
     for line in f:
@@ -402,15 +410,29 @@ def filter_tokenized_file(filename, min_len=10, max_len=50):
 
       words = sent.split()
 
-      if len(words) < min_len or len(words) > max_len:
+      if len(words) < min_len:
         continue
 
       num_punk = 0
+      num_known = 0
+      filter_flag = False
+
       for word in words:
+        if word.lower() in filters:
+          filter_flag = True
+          break
+
         if not word.isalnum():
           num_punk += 1
 
-      if num_punk >= len(words) * 0.5:
+        elif word in vocab:
+          num_known += 1
+
+      if filter_flag:
+        continue
+
+      thresh = len(words) * 0.5
+      if num_punk >= thresh or num_known < 1:
         continue
 
       sents.append(sent)
@@ -424,20 +446,28 @@ def filter_tokenized_file(filename, min_len=10, max_len=50):
 
 def authorship_filter(exp_id=0):
   _, filenames = split_bookcorpus(exp_id)
-  # print(filenames)
-  Parallel(n_jobs=8, verbose=1)(
-    delayed(filter_tokenized_file)(filename)
-    for filename in filenames)
+  vocab = build_vocabulary(exp_id, rebuild=False)
+  Parallel(n_jobs=32)(
+      delayed(filter_tokenized_file)(filename, vocab)
+      for filename in tqdm.tqdm(filenames))
 
 
-def load_single_author_file(filename, split_word):
+def load_single_author_file(filename, split_word, remove_punct, min_len=0):
   sents = []
   with smart_open.open(os.path.join(BOOKCORPUS_AUTHOR_DIR, filename),
                        encoding='utf-8') as f:
     for line in f:
       sent = line.replace('\n', '')
-      if split_word:
+      if remove_punct:
+        sent = keras_preprocessing.text.text_to_word_sequence(sent, lower=False)
+      else:
         sent = sent.split()
+
+      if len(sent) < min_len:
+        continue
+
+      if not split_word:
+        sent = " ".join(sent)
 
       sents.append(sent)
     return sents
@@ -445,7 +475,8 @@ def load_single_author_file(filename, split_word):
 
 def load_author_data(min_book=2, train_size=50, test_size=300,
                      unlabeled_size=0, top_attr=0, split_by_book=True,
-                     split_word=True, seed=12345):
+                     split_word=True, remove_punct=False, seed=54321,
+                     min_len=0):
 
   min_size = max(test_size + unlabeled_size, test_size * 2)
   if split_by_book:
@@ -457,8 +488,16 @@ def load_author_data(min_book=2, train_size=50, test_size=300,
   author_book_count = Counter(attribute_dict.values())
   filtered_filenames = [fname for fname in filenames if
                         author_book_count[attribute_dict[fname]] >= min_book]
-  file_sents = [load_single_author_file(fname, split_word) for fname in
-                tqdm.tqdm(filtered_filenames)]
+
+  if remove_punct:
+    file_sents = Parallel(n_jobs=8)(
+      delayed(load_single_author_file)(fname, split_word, remove_punct, min_len)
+      for fname in tqdm.tqdm(filtered_filenames)
+    )
+  else:
+    file_sents = [load_single_author_file(fname, split_word,
+                                          remove_punct, min_len)
+                  for fname in tqdm.tqdm(filtered_filenames)]
 
   author_file_sents = defaultdict(list)
   author_sent_counts = Counter()
@@ -526,8 +565,9 @@ def load_author_data(min_book=2, train_size=50, test_size=300,
     unlabeled_sents = np.concatenate(unlabeled_sents)
 
   return train_sents, train_authors, test_sents, test_authors, \
-         unlabeled_sents, unlabeled_authors
+      unlabeled_sents, unlabeled_authors
 
 
 if __name__ == '__main__':
-  load_book_author()
+  authorship_filter()
+  # load_author_data()

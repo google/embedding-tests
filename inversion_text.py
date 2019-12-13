@@ -23,56 +23,50 @@ import tensorflow as tf
 import time
 from absl import app
 from absl import flags
-from sklearn.model_selection import train_test_split
 
-from attribute.utils import filter_infrequent_attribute
-from data.common import EMB_DIR, MODEL_DIR
-from data.bookcorpus import load_initialized_word_emb, load_data_with_attribute
-from data.wiki103 import load_cross_domain_invert_data
+from data.bookcorpus import load_initialized_word_emb, build_vocabulary, \
+  load_author_data as load_bookcorpus_author
+from data.reddit import load_author_data as reddit_author_data
+from data.common import MODEL_DIR
+from data.wiki103 import load_wiki_cross_domain_data as load_cross_domain_data
 from invert.models import MultiLabelInversionModel, MultiSetInversionModel, \
   RecurrentInversionModel
 from invert.utils import sents_to_labels, count_label_freq, \
-  tp_fp_fn_metrics, tp_fp_fn_metrics_np
+  tp_fp_fn_metrics, tp_fp_fn_metrics_np, sinkhorn, continuous_topk_v2
+from text_encoder import encode_sentences
+from train_feature_mapper import linear_mapping, mlp_mapping, gan_mapping
+from thought import get_model_ckpt_name, get_model_config
 from thought.quick_thought_model import QuickThoughtModel
 from utils.common_utils import log
-from utils.sent_utils import iterate_minibatches_indices, load_raw_sents, \
-  load_embeds, get_similarity_metric
+from utils.sent_utils import iterate_minibatches_indices, get_similarity_metric
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-flags.DEFINE_integer('emb_dim', 620, 'embedding dimension')
-flags.DEFINE_integer('encoder_dim', 1200, 'encoder dim')
-flags.DEFINE_integer('context_size', 1, 'Context size')
-flags.DEFINE_integer('num_layer', 3, 'Number of transformer layer')
-flags.DEFINE_integer('batch_size', 800, 'Batch size')
 flags.DEFINE_integer('epoch', 0, 'Epochs of training')
-flags.DEFINE_integer('freq_min', 90,
-                     'use rare words above this percentile, e.g. 80=the most '
-                     'infrequent 20 percent sentences')
-flags.DEFINE_integer('attack_batch_size', 128, 'Attack batch size')
+flags.DEFINE_integer('batch_size', 800, 'Batch size')
+flags.DEFINE_integer('attack_batch_size', 32, 'Attack batch size')
 flags.DEFINE_integer('max_iters', 1000, 'Max iterations for optimization')
-flags.DEFINE_integer('seq_len', 10, 'Fixed recover sequence length')
-flags.DEFINE_integer('train_size', 100, 'Number of authors data to use')
+flags.DEFINE_integer('seq_len', 15, 'Fixed recover sequence length')
+flags.DEFINE_integer('train_size', 250, 'Number of authors data to use')
+flags.DEFINE_integer('test_size', 125, 'Number of authors data to test')
 flags.DEFINE_integer('print_every', 1, 'Print metrics every iteration')
-
+flags.DEFINE_integer('high_layer_idx', -1, 'Output layer index')
+flags.DEFINE_integer('low_layer_idx', -1, 'Optimize layer index')
 flags.DEFINE_float('C', 0.0, 'Label distribution aware margin')
 flags.DEFINE_float('alpha', 0.0, 'Coefficient for regularization')
 flags.DEFINE_float('lr', 1e-3, 'Learning rate')
 flags.DEFINE_float('wd', 1e-4, 'Weight decay')
 flags.DEFINE_float('temp', 0.1, 'Temperature for optimization')
-
-flags.DEFINE_string('cell_type', 'LSTM', 'Encoder model')
+flags.DEFINE_float('gamma', 0.0, 'Loss ratio for adversarial')
+flags.DEFINE_string('attr', 'word', 'Attributes to censor')
 flags.DEFINE_string('model', 'multiset', 'Model for learning based inversion')
-flags.DEFINE_string('opt', 'softmax', 'Optimization model')
 flags.DEFINE_string('metric', 'l2', 'Metric to optimize')
-flags.DEFINE_string('hub_model_name', 'quickthought', 'hub_model_name')
-flags.DEFINE_string('model_dir',  os.path.join(MODEL_DIR, 's2v'),
+flags.DEFINE_string('model_name', 'quickthought', 'Model name')
+flags.DEFINE_string('model_dir', os.path.join(MODEL_DIR, 'models', 's2v'),
                     'Model directory for embedding model')
-flags.DEFINE_string('emb_dir',  EMB_DIR,
-                    'Feature directory for saving embedding model')
-
-flags.DEFINE_boolean('prior', False, 'Use deep prior for optimization')
-flags.DEFINE_boolean('use_hub', False, 'Embedding from hub module')
+flags.DEFINE_string('data_name', 'bookcorpus', 'Data name')
+flags.DEFINE_string('mapper', 'linear', 'Mapper to use')
+flags.DEFINE_boolean('permute', False, 'Optimize permutation matrix')
 flags.DEFINE_boolean('learning', False, 'Learning based inversion '
                                         'or optimize based')
 flags.DEFINE_boolean('cross_domain', False, 'Cross domain data for learning '
@@ -81,71 +75,68 @@ FLAGS = flags.FLAGS
 
 
 def load_inversion_data():
-  all_filenames, attribute_dict = load_data_with_attribute('author')
+  vocab = build_vocabulary(rebuild=False)
 
-  raw_dir = os.path.join(
-    FLAGS.emb_dir, 'bookcorpus_raw_rare{}'.format(FLAGS.freq_min))
-  sents, masks = load_raw_sents(all_filenames, raw_dir, rtn_filenames=False)
-
-  model_type = FLAGS.cell_type
-  if model_type == 'TRANS':
-    model_type += 'l{}'.format(FLAGS.num_layer)
-
-  model_name = 'e{}_{}_b{}'.format(FLAGS.epoch, model_type, FLAGS.batch_size)
-  if FLAGS.use_hub:
-    assert FLAGS.learning
-    model_name = FLAGS.hub_model_name
-
-  feat_dir = os.path.join(FLAGS.emb_dir, 'bookcorpus_{}_rare{}'.format(
-    model_name, FLAGS.freq_min))
-  log('Load embeddings from {}'.format(feat_dir))
-
-  filenames, embs = load_embeds(all_filenames, feat_dir, rtn_filenames=True)
-  assert len(embs) == len(sents)
-
-  all_inputs = [embs, sents, masks]
-  all_labels = np.asarray([attribute_dict[fname] for fname in filenames])
-
-  filtered_indices = filter_infrequent_attribute(all_labels, 100)
-  all_inputs = [inputs[filtered_indices] for inputs in all_inputs]
-
-  all_embeds, all_sents, all_masks = all_inputs
-  all_labels = all_labels[filtered_indices]
-  all_attributes = np.sort(np.unique(all_labels))
-
-  # split train and test
-  train_attrs, test_attrs = train_test_split(all_attributes,
-                                             train_size=FLAGS.train_size,
-                                             test_size=FLAGS.train_size * 10,
-                                             random_state=12345)
-
-  train_attrs, test_attrs = set(train_attrs), set(test_attrs)
-  train_indices, test_indices = [], []
-
-  for idx, attr in enumerate(all_labels):
-    if attr in train_attrs:
-      train_indices.append(idx)
-    if attr in test_attrs:
-      test_indices.append(idx)
+  if FLAGS.data_name == 'bookcorpus':
+    train_sents, _, test_sents, _, _, _ = load_bookcorpus_author(
+        train_size=FLAGS.train_size, test_size=FLAGS.test_size,
+        unlabeled_size=0, split_by_book=True, split_word=True,
+        top_attr=800)
+  elif FLAGS.data_name == 'reddit':
+    train_sents, _, test_sents, _, _, _ = reddit_author_data(
+        train_size=FLAGS.train_size, test_size=1, unlabeled_size=0,
+        split_word=True, top_attr=0)
+  else:
+    raise ValueError(FLAGS.data_name)
 
   if FLAGS.cross_domain:
-    log('Load cross domain embeddings from {}'.format(FLAGS.hub_model_name))
-    train_x, train_y, train_m = load_cross_domain_invert_data(
-        FLAGS.hub_model_name)
-  else:
-    train_x, train_y, train_m = all_embeds[train_indices], all_sents[
-      train_indices], all_masks[train_indices]
+    train_sents = load_cross_domain_data(800000, split_word=True)
+    log('Loaded {} cross domain sentences'.format(len(train_sents)))
 
-  test_x, test_y, test_m = all_embeds[test_indices], all_sents[test_indices], \
-                           all_masks[test_indices]
+  ckpt_name = get_model_ckpt_name(FLAGS.model_name, epoch=FLAGS.epoch,
+                                  batch_size=FLAGS.batch_size,
+                                  gamma=FLAGS.gamma, num_layer=3,
+                                  attr=FLAGS.attr)
+  model_path = os.path.join(FLAGS.model_dir, ckpt_name, 'model.ckpt')
+  config = get_model_config(FLAGS.model_name)
+
+  train_data, test_data = encode_sentences(
+      vocab, model_path, config, train_sents, test_sents,
+      low_layer_idx=FLAGS.low_layer_idx, high_layer_idx=FLAGS.high_layer_idx)
+  # clear session data for later optimization or learning
+  tf.keras.backend.clear_session()
+
+  train_x, train_y, train_m = train_data
+  test_x, test_y, test_m = test_data
+
+  if FLAGS.low_layer_idx != FLAGS.high_layer_idx:
+    log('Training high to low mapping...')
+    if FLAGS.mapper == 'linear':
+      mapping = linear_mapping(train_x[1], train_x[0])
+    elif FLAGS.mapper == 'mlp':
+      mapping = mlp_mapping(train_x[1], train_x[0], epochs=50,
+                            activation=tf.nn.relu)
+    elif FLAGS.mapper == 'gan':
+      mapping = gan_mapping(train_x[1], train_x[0], disc_iters=5,
+                            batch_size=64, gamma=1.0, epoch=100,
+                            activation=tf.tanh)
+    else:
+      raise ValueError(FLAGS.mapper)
+    test_x = mapping(test_x[1])
+    train_x = train_x[0]
 
   log('Loaded {} embeddings for inversion with shape {}'.format(
       test_x.shape[0], test_x.shape[1]))
-  return train_x, test_x, train_y, test_y, train_m, test_m
+
+  data = (train_x, test_x, train_y, test_y, train_m, test_m)
+  return data
 
 
-def learning_invert(data, num_words, batch_size):
+def learning_invert(data, batch_size):
   train_x, test_x, train_y, test_y, train_m, test_m = data
+
+  config = get_model_config(FLAGS.model_name)
+  num_words = config['vocab_size']
 
   if FLAGS.model != 'rnn':
     train_y, test_y = sents_to_labels(train_y), sents_to_labels(test_y)
@@ -166,8 +157,14 @@ def learning_invert(data, num_words, batch_size):
   training = tf.placeholder(tf.bool, name='training')
 
   if FLAGS.model == 'multiset':
-    init_word_emb = load_initialized_word_emb()
-    model = MultiSetInversionModel(init_word_emb.shape[1], num_words,
+    if num_words == 50001:
+      init_word_emb = load_initialized_word_emb()
+      emb_dim = init_word_emb.shape[1]
+    else:
+      init_word_emb = None
+      emb_dim = 512
+
+    model = MultiSetInversionModel(emb_dim, num_words,
                                    FLAGS.seq_len, init_word_emb,
                                    C=C, label_margin=label_margin)
     preds, loss = model.forward(inputs, labels, training)
@@ -208,7 +205,7 @@ def learning_invert(data, num_words, batch_size):
   with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
     sess.run(tf.global_variables_initializer())
 
-    for epoch in range(50):
+    for epoch in range(30):
       train_iterations = 0
       train_loss = 0
 
@@ -253,6 +250,12 @@ def learning_invert(data, num_words, batch_size):
         else:
           err, tp, fp, fn = fetch
 
+        # for yy, pp in zip(test_y[batch_idx], pred):
+        #   matched = np.intersect1d(np.unique(yy), np.unique(pp))
+        #   if len(matched) >= 0.8 * len(yy):
+        #     print(' '.join([inv_vocab[w] for w in yy]))
+        #     print(' '.join([inv_vocab[w] for w in np.unique(pp)]))
+
         test_iterations += 1
         test_loss += err
         test_tp += tp
@@ -270,61 +273,68 @@ def learning_invert(data, num_words, batch_size):
             precision, recall, f1))
 
 
-def optimization_invert(data, num_words, lr=1e-3, attack_batch_size=8,
+def optimization_invert(data, lr=1e-3, attack_batch_size=8,
                         seq_len=5, max_iters=1000):
   # use softmax to select words
   _, x, _, y = data[:4]
   y = sents_to_labels(y)
 
-  model = QuickThoughtModel(num_words, FLAGS.emb_dim, FLAGS.encoder_dim,
-                            FLAGS.context_size, FLAGS.cell_type,
-                            num_layer=FLAGS.num_layer,
-                            init_word_emb=None, train=False)
-  model_type = FLAGS.cell_type
-  if model_type == 'TRANS':
-    model_type += 'l{}'.format(FLAGS.num_layer)
-
-  model_name = 'e{}_{}_b{}'.format(FLAGS.epoch, model_type, FLAGS.batch_size)
+  config = get_model_config(FLAGS.model_name)
+  num_words = config['vocab_size']
+  model = QuickThoughtModel(num_words, config['emb_dim'],
+                            config['encoder_dim'], 1, init_word_emb=None,
+                            cell_type=config['cell_type'],
+                            num_layer=config['num_layer'], train=False)
   word_emb = model.word_in_emb
+  targets = tf.placeholder(tf.float32,
+                           shape=(attack_batch_size, x.shape[1]))
 
-  if FLAGS.prior:
-    attack_batch_size = 1  # one prior NN per example
-    init_word_emb = load_initialized_word_emb()
-    prior_encoder_dim = init_word_emb.shape[1]
+  log('Inverting {} words from {} embeddings'.format(num_words, len(x)))
 
-    inputs = tf.get_variable(
-      name='inputs', shape=(attack_batch_size, seq_len, prior_encoder_dim),
-      initializer=tf.random_uniform_initializer(-0.1, 0.1), trainable=False)
+  if FLAGS.permute:
+    # modeling the top k words then permute the order
+    logit_inputs = tf.get_variable(
+      name='inputs',
+      shape=(attack_batch_size, seq_len, num_words - 1),
+      initializer=tf.random_uniform_initializer(-0.1, 0.1))
+    t_vars = [logit_inputs]
 
-    rnn_prior = tf.keras.layers.CuDNNLSTM(init_word_emb.shape[1],
-                                          return_sequences=True,
-                                          name='prior_rnn')
-    prior_word_emb = tf.Variable(
-      tf.convert_to_tensor(init_word_emb, dtype=tf.float32),
-      name='prior_word_emb')
+    prob_inputs = continuous_topk_v2(logit_inputs, seq_len, FLAGS.temp)
+    pad_inputs = tf.zeros((attack_batch_size, seq_len, 1))
+    prob_inputs = tf.concat([pad_inputs, prob_inputs], axis=2)
+    emb_inputs = tf.matmul(prob_inputs, word_emb)
 
-    rnn_outputs = rnn_prior(inputs)
-    logit_inputs = tf.matmul(rnn_outputs, prior_word_emb, transpose_b=True)
+    permute_inputs = tf.get_variable(
+        name='permute_inputs',
+        shape=(attack_batch_size, seq_len, seq_len),
+        initializer=tf.truncated_normal_initializer(0, 0.1))
+    t_vars.append(permute_inputs)
 
-    t_vars = [v for v in tf.trainable_variables() if v.name.startswith('prior')]
-    t_var_names = set(v.name for v in t_vars + [inputs])
+    permute_matrix = sinkhorn(permute_inputs / FLAGS.temp, 20)
+    emb_inputs = tf.matmul(permute_matrix, emb_inputs)
   else:
     logit_inputs = tf.get_variable(
-      name='inputs', shape=(attack_batch_size, seq_len, num_words),
+      name='inputs',
+      shape=(attack_batch_size, seq_len, num_words - 1),
       initializer=tf.random_uniform_initializer(-0.1, 0.1))
-
     t_vars = [logit_inputs]
-    t_var_names = {logit_inputs.name}
 
-  prob_inputs = tf.nn.softmax(logit_inputs / FLAGS.temp, axis=-1)
+    pad_inputs = tf.ones((attack_batch_size, seq_len, 1), tf.float32) * (-1e9)
+    logit_inputs = tf.concat([pad_inputs, logit_inputs], axis=2)
+    prob_inputs = tf.nn.softmax(logit_inputs / FLAGS.temp, axis=-1)
+    emb_inputs = tf.matmul(prob_inputs, word_emb)
+
+  preds = tf.argmax(prob_inputs, axis=-1)
+  t_var_names = set([v.name for v in t_vars])
+
   masks = tf.ones(shape=(attack_batch_size, seq_len), dtype=tf.int32)
-  targets = tf.placeholder(tf.float32,
-                           shape=(attack_batch_size, FLAGS.encoder_dim))
+  all_layers = model.encode(emb_inputs, masks, model.in_cells, model.proj_in,
+                            return_all_layers=True)
+  encoded = all_layers[FLAGS.low_layer_idx]
 
-  emb_inputs = tf.matmul(prob_inputs, word_emb)
-  encoded = model.encode(emb_inputs, masks, model.in_cells, model.proj_in)
   loss = get_similarity_metric(encoded, targets, FLAGS.metric, rtn_loss=True)
   loss = tf.reduce_sum(loss)
+
   if FLAGS.alpha > 0.:
     # encourage the words to be different
     diff = tf.expand_dims(prob_inputs, 2) - tf.expand_dims(prob_inputs, 1)
@@ -332,72 +342,88 @@ def optimization_invert(data, num_words, lr=1e-3, attack_batch_size=8,
     loss += FLAGS.alpha * tf.reduce_sum(reg)
 
   optimizer = tf.train.AdamOptimizer(lr)
-  model_vars = [v for v in tf.global_variables() if v.name not in t_var_names]
+  model_vars = [v for v in tf.global_variables()
+                if v.name not in t_var_names]
   saver = tf.train.Saver(model_vars)
   start_vars = set(v.name for v in model_vars)
 
   grads_and_vars = optimizer.compute_gradients(loss, t_vars)
   train_ops = optimizer.apply_gradients(
-    grads_and_vars, global_step=tf.train.get_or_create_global_step())
+      grads_and_vars, global_step=tf.train.get_or_create_global_step())
   end_vars = tf.global_variables()
   new_vars = [v for v in end_vars if v.name not in start_vars]
 
-  preds = tf.argmax(prob_inputs, axis=-1)
   batch_init_ops = tf.variables_initializer(new_vars)
 
   total_it = len(x) // attack_batch_size
   with tf.Session() as sess:
-    saver.restore(sess, os.path.join(FLAGS.model_dir,
-                                     'bookcorpus_{}'.format(model_name),
-                                     'model.ckpt'))
+    ckpt_name = get_model_ckpt_name(FLAGS.model_name, epoch=FLAGS.epoch,
+                                    batch_size=FLAGS.batch_size, num_layer=3,
+                                    gamma=FLAGS.gamma, attr=FLAGS.attr)
+    ckpt_path = os.path.join(FLAGS.model_dir, ckpt_name, 'model.ckpt')
+    log('Restoring model from {}'.format(ckpt_path))
+    saver.restore(sess, ckpt_path)
 
     def invert_one_batch(batch_targets):
       sess.run(batch_init_ops)
+      feed_dict = {targets: batch_targets}
+      prev = 1e6
       for i in range(max_iters):
-        sess.run([loss, train_ops], feed_dict={targets: batch_targets})
-      return sess.run([preds, loss], feed_dict={targets: batch_targets})
+        curr, _ = sess.run([loss, train_ops], feed_dict)
+        # stop if no progress
+        if (i + 1) % (max_iters // 10) == 0 and curr > prev:
+          break
+        prev = curr
+      return sess.run([preds, loss], feed_dict)
 
-    eval_opt_invert(x, y, invert_one_batch, attack_batch_size, total_it)
+    it = 0.0
+    all_tp, all_fp, all_fn, all_err = 0.0, 0.0, 0.0, 0.0
 
+    start_time = time.time()
 
-def eval_opt_invert(x, y, invert_opt_fn, attack_batch_size, total_it):
-  it = 0.0
-  all_tp, all_fp, all_fn, all_err = 0.0, 0.0, 0.0, 0.0
+    # vocab = build_vocabulary(exp_id=0, rebuild=False)
+    # inv_vocab = dict((v, k) for k, v in vocab.items())
 
-  start_time = time.time()
-  for batch_idx in iterate_minibatches_indices(len(x), attack_batch_size, False,
-                                               False):
-    y_pred, err = invert_opt_fn(x[batch_idx])
-    tp, fp, fn = tp_fp_fn_metrics_np(y_pred, y[batch_idx])
+    for batch_idx in iterate_minibatches_indices(len(x), attack_batch_size,
+                                                 False, False):
+      y_pred, err = invert_one_batch(x[batch_idx])
+      tp, fp, fn = tp_fp_fn_metrics_np(y_pred, y[batch_idx])
+      # for yy, pp in zip(y[batch_idx], y_pred):
+      #   matched = np.intersect1d(np.unique(yy), np.unique(pp))
+      #   if len(matched) >= 0.75 * len(yy):
+      #     print(' '.join([inv_vocab[w] for w in yy]))
+      #     print(' '.join([inv_vocab[w] for w in np.unique(pp)]))
 
-    it += 1.0
-    all_err += err
-    all_tp += tp
-    all_fp += fp
-    all_fn += fn
+      it += 1.0
+      all_err += err
+      all_tp += tp
+      all_fp += fp
+      all_fn += fn
+
+      all_pre = all_tp / (all_tp + all_fp + 1e-7)
+      all_rec = all_tp / (all_tp + all_fn + 1e-7)
+      all_f1 = 2 * all_pre * all_rec / (all_pre + all_rec + 1e-7)
+
+      if it % FLAGS.print_every == 0:
+        it_time = (time.time() - start_time) / it
+        log('Iter {:.2f}%, err={}, pre={:.2f}%, rec={:.2f}%, f1={:.2f}%,'
+            ' {:.2f} sec/it'.format(it / total_it * 100, all_err / it,
+                                    all_pre * 100, all_rec * 100, all_f1 * 100,
+                                    it_time))
 
     all_pre = all_tp / (all_tp + all_fp + 1e-7)
     all_rec = all_tp / (all_tp + all_fn + 1e-7)
     all_f1 = 2 * all_pre * all_rec / (all_pre + all_rec + 1e-7)
-
-    if it % FLAGS.print_every == 0:
-      it_time = (time.time() - start_time) / it
-      log("Iter {:.2f}%, err={}, pre={:.2f}%, rec={:.2f}%, f1={:.2f}%,"
-          " {:.2f} sec/it".format(it / total_it * 100, all_err / it,
-                                  all_pre * 100, all_rec * 100,
-                                  all_f1 * 100, it_time))
-
-  log("Final err={}, pre={:.2f}%, rec={:.2f}%, f1={:.2f}%".format(
-    all_err / it, all_pre * 100, all_rec * 100, all_f1 * 100))
+    log('Final err={}, pre={:.2f}%, rec={:.2f}%, f1={:.2f}%'.format(
+        all_err / it, all_pre * 100, all_rec * 100, all_f1 * 100))
 
 
-def main(unused_argv):
+def main(_):
   data = load_inversion_data()
   if FLAGS.learning:
-    learning_invert(data=data, num_words=50001,
-                    batch_size=FLAGS.attack_batch_size)
+    learning_invert(data=data, batch_size=FLAGS.attack_batch_size)
   else:
-    optimization_invert(data=data, num_words=50001, seq_len=FLAGS.seq_len,
+    optimization_invert(data=data, seq_len=FLAGS.seq_len,
                         attack_batch_size=FLAGS.attack_batch_size,
                         max_iters=FLAGS.max_iters)
 

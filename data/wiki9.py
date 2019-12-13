@@ -15,26 +15,26 @@
 from __future__ import division
 from __future__ import print_function
 
-import bz2
-import logging
-import multiprocessing
-import os
-import random
+from gensim.corpora.wikicorpus import WikiCorpus, init_to_ignore_interrupt, \
+  ARTICLE_MIN_WORDS, _process_article, IGNORED_NAMESPACES, get_namespace
 from pickle import PicklingError
 from xml.etree.cElementTree import iterparse, ParseError
 
-import gensim.utils
+from common import gen_seed, DATA_DIR
 import smart_open
+import random
+import gensim.utils
+import os
+import bz2
+import multiprocessing
+import logging
 import tqdm
-from gensim.corpora.wikicorpus import WikiCorpus, init_to_ignore_interrupt, \
-  ARTICLE_MIN_WORDS, _process_article, IGNORED_NAMESPACES, get_namespace
+
 from six import raise_from
 
-from common import DATA_DIR, gen_seed
-
-WIKI9_PATH = DATA_DIR + 'enwik9.bz2'
-WIKI9_DIR = DATA_DIR + 'wiki9/'
-WIKI9_SPLIT_DIR = DATA_DIR + 'wiki9_split/'
+WIKI9_PATH = os.path.join(DATA_DIR, 'wiki9', 'enwik9.bz2')
+WIKI9_DIR = os.path.join(DATA_DIR, 'wiki9', 'articles')
+WIKI9_SPLIT_DIR = os.path.join(DATA_DIR, 'wiki9', 'split')
 
 for d in [WIKI9_DIR, WIKI9_SPLIT_DIR]:
   if not os.path.exists(d):
@@ -68,10 +68,10 @@ def extract_pages(f, filter_namespaces=False, filter_articles=None):
 
       if filter_articles is not None:
         if not filter_articles(
-                elem, namespace=namespace, title=title,
-                text=text, page_tag=page_tag,
-                text_path=text_path, title_path=title_path,
-                ns_path=ns_path, pageid_path=pageid_path):
+          elem, namespace=namespace, title=title,
+          text=text, page_tag=page_tag,
+          text_path=text_path, title_path=title_path,
+          ns_path=ns_path, pageid_path=pageid_path):
           text = None
 
       pageid = elem.find(pageid_path).text
@@ -81,6 +81,10 @@ def extract_pages(f, filter_namespaces=False, filter_articles=None):
 
 
 class MyWikiCorpus(WikiCorpus):
+  @staticmethod
+  def save_corpus(fname, corpus, id2word=None, metadata=False):
+    pass
+
   def get_texts(self):
     logger = logging.getLogger(__name__)
 
@@ -88,11 +92,11 @@ class MyWikiCorpus(WikiCorpus):
     positions, positions_all = 0, 0
 
     tokenization_params = (
-        self.tokenizer_func, self.token_min_len, self.token_max_len, self.lower)
+      self.tokenizer_func, self.token_min_len, self.token_max_len, self.lower)
     texts = ((text, self.lemmatize, title, pageid, tokenization_params)
-        for title, text, pageid
-        in extract_pages(bz2.BZ2File(self.fname), self.filter_namespaces,
-                        self.filter_articles))
+             for title, text, pageid in extract_pages(bz2.BZ2File(self.fname),
+                                                      self.filter_namespaces,
+                                                      self.filter_articles))
 
     pool = multiprocessing.Pool(self.processes, init_to_ignore_interrupt)
 
@@ -126,7 +130,7 @@ class MyWikiCorpus(WikiCorpus):
       raise_from(
         PicklingError('Can not send filtering function {} to multiprocessing, '
                       'make sure the function can be pickled.'.format(
-          self.filter_articles)), exc)
+                        self.filter_articles)), exc)
     else:
       logger.info(
         "finished iterating over Wikipedia corpus of %i "
@@ -194,4 +198,4 @@ class WIKI9Articles(object):
 
 
 if __name__ == '__main__':
-  write_wiki9_articles()
+  split_wiki9_articles()

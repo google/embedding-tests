@@ -23,10 +23,11 @@ from tensor2tensor.utils import beam_search
 
 
 class MultiLabelInversionModel(object):
-  def __init__(self, output_size, C=0., label_margin=None, init_word_emb=None):
+  def __init__(self, output_size, C=0., label_margin=None, init_word_emb=None,
+               drop_p=0.25):
     self.C = C
     self.label_margin = label_margin
-    self.dropout = tf.keras.layers.Dropout(0.25)
+    self.dropout = tf.keras.layers.Dropout(drop_p)
     self.fc = tf.keras.layers.Dense(output_size, name='output')
     if init_word_emb is not None:
       self.embedding = tf.convert_to_tensor(init_word_emb, dtype=tf.float32)
@@ -58,7 +59,7 @@ class MultiLabelInversionModel(object):
 
 class RecurrentInversionModel(object):
   def __init__(self, emb_dim, output_size, seq_len=10, init_word_emb=None,
-               beam_size=5, C=0., label_margin=None):
+               beam_size=5, C=0., label_margin=None, drop_p=0.25):
     self.C = C
     self.label_margin = label_margin
     self.beam_size = beam_size
@@ -66,10 +67,11 @@ class RecurrentInversionModel(object):
     self.emb_dim = emb_dim
     self.output_size = output_size
     self.decoder = tf.keras.layers.CuDNNLSTM(emb_dim, return_sequences=True)
-    self.dropout = tf.keras.layers.Dropout(0.25)
+    self.dropout = tf.keras.layers.Dropout(drop_p)
     self.fc = tf.keras.layers.Dense(emb_dim, use_bias=False)
 
-    self.eos_id = self.output_size
+    self.eos_id = 0
+    self.sos_id = output_size
     self.embedding = tf.Variable(self.get_or_init_word_emb(init_word_emb),
                                  name="output_emb")
 
@@ -112,11 +114,11 @@ class RecurrentInversionModel(object):
       o = tf.matmul(r, self.embedding, transpose_b=True)
       return o, states
 
-    initial_ids = tf.zeros((b,), tf.int32)
+    initial_ids = tf.ones((b,), tf.int32) * self.sos_id
     beam_preds, _, _ = beam_search.beam_search(
       pred_fn, initial_ids, alpha=0., beam_size=self.beam_size,
-      decode_length=self.seq_len,
-      vocab_size=self.output_size + 1, eos_id=self.eos_id, states=[h0, h0])
+      decode_length=self.seq_len, vocab_size=self.output_size + 1,
+      eos_id=self.eos_id, states=[h0, h0])
 
     return beam_preds[:, 0, 1:], loss
 
@@ -165,7 +167,10 @@ class MultiSetInversionModel(object):
       return self.predict_loop(labels, xt, states, training)
 
   def unrolled_predict_loop(self, labels, xt, states, training):
+    batch_size = tf.shape(labels)[0]
     labels_t = tf.identity(labels)
+    finished_t = tf.zeros(batch_size, dtype=tf.bool)     # B
+
     predictions = []
     losses = []
     for t in range(self.steps):
@@ -175,6 +180,12 @@ class MultiSetInversionModel(object):
       logits = tf.matmul(ht, self.embedding, transpose_b=True)
 
       yt = tf.argmax(logits, axis=1)  # predicted label at this step
+      yt = tf.where(finished_t, self.eos_id * tf.ones_like(yt), yt)
+
+      # update finished
+      finished = tf.equal(yt, self.eos_id)
+      finished_t = tf.logical_or(finished_t, finished)
+
       xt = tf.nn.embedding_lookup(self.embedding, yt)
       yt_one_hot = tf.one_hot(yt, self.output_size)
       predictions.append(tf.cast(yt_one_hot, tf.bool))
@@ -196,10 +207,10 @@ class MultiSetInversionModel(object):
 
   def predict_loop(self, labels, xt, states, training):
     # B = batch size, V = vocab size, E = embedding size
-    init_labels_t = labels  # B x V
+    batch_size = tf.shape(labels)[0]
+    init_labels_t = tf.identity(labels)  # B x V
     init_input_t = xt       # B x E
     init_states_t = states  # B x E
-    batch_size = tf.shape(labels)[0]
     init_finished_t = tf.zeros(batch_size, dtype=tf.bool)     # B
     init_prediction_t = tf.zeros_like(labels, dtype=tf.bool)  # B x V
     init_loss_t = tf.zeros(batch_size)

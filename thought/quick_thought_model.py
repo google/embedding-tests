@@ -68,9 +68,17 @@ def _positional_encoding(position, d_model):
   return tf.cast(pos_encoding, dtype=tf.float32)
 
 
+def mean_pool(encoded, masks):
+  masks = tf.cast(masks, tf.float32)
+  encoded = encoded * tf.expand_dims(masks, axis=2)
+  encoded_sum = tf.reduce_sum(encoded, axis=1)
+  lengths = tf.reduce_sum(masks, axis=1, keepdims=True)
+  return encoded_sum / lengths
+
+
 class QuickThoughtModel(object):
-  def __init__(self, vocab_size, emb_dim, encoder_dim, context_size,
-               cell_type="TRANS", num_layer=2, init_word_emb=None,
+  def __init__(self, vocab_size, emb_dim, encoder_dim, context_size=1,
+               cell_type="TRANS", num_layer=3, init_word_emb=None,
                train=True, drop_p=0.):
 
     super(QuickThoughtModel, self).__init__()
@@ -105,8 +113,8 @@ class QuickThoughtModel(object):
                                              cell_type, False, True)
       self.out_cells = [self.out_cell_fw, self.out_cell_bw]
       # no projection as in original paper
-      self.proj_in = None  # _initialze_dense(encoder_dim, "proj_in")
-      self.proj_out = None  # _initialze_dense(encoder_dim, "proj_out")
+      self.proj_in = None
+      self.proj_out = None
     else:
       assert cell_type == "TRANS"
       self.pos_encoding = _positional_encoding(4096, self.emb_dim)
@@ -129,22 +137,38 @@ class QuickThoughtModel(object):
     else:
       return tf.convert_to_tensor(weights, dtype=tf.float32)
 
-  def encode(self, inputs, masks, cells, proj):
+  def encode(self, inputs, masks, cells, proj, return_all_layers=False):
     masks = tf.cast(masks, dtype=tf.int32)
     if self.cell_type in ["GRU", "LSTM"]:
       state = self.encode_cudarnn(inputs, masks, cells[0], cells[1])
+      all_layers = [mean_pool(inputs, masks), state]
     else:
+      all_layers = [mean_pool(inputs, masks)]
       seq_len = tf.shape(inputs)[1]
       inputs += self.pos_encoding[:, :seq_len, :]
       state = cells[0].forward(inputs, masks)
+      all_layers += cells[0].outputs
       state = proj(state)
+      all_layers += [state]
+
+    if return_all_layers:
+      return all_layers
 
     if self.train and self.drop_p > 0.:
       state = tf.nn.dropout(state, rate=self.drop_p)
 
     return state
 
-  def encode_cudarnn(self, inputs, masks, cell_fw, cell_bw):
+  def encode_sequence(self, inputs, masks, cells, norm=True):
+    outputs = self.encode_cudarnn(inputs, masks, cells[0], cells[1], True)
+    outputs = tf.multiply(outputs, tf.cast(tf.expand_dims(masks, 2),
+                                           tf.float32))
+    if norm:
+      outputs = tf.nn.l2_normalize(outputs, axis=2, epsilon=1e-4)
+    return outputs
+
+  def encode_cudarnn(self, inputs, masks, cell_fw, cell_bw,
+                     return_sequences=False):
     assert self.cell_type in ["GRU", "LSTM"]
     inputs = tf.multiply(inputs, tf.cast(tf.expand_dims(masks, 2), tf.float32))
     indices = tf.reduce_sum(masks, 1, keepdims=True) - 1
@@ -156,6 +180,10 @@ class QuickThoughtModel(object):
     inputs_bw = tf.reverse_sequence(inputs, tf.reduce_sum(masks, 1), 1, 0)
     outputs_bw = cell_bw(inputs_bw)
     state_bw = tf.gather_nd(outputs_bw, indices, batch_dims=1)
+
+    if return_sequences:
+      outputs = tf.concat([outputs_fw, outputs_bw], axis=2)
+      return outputs
 
     state = tf.concat([state_fw, state_bw], 1)
     return state
@@ -183,6 +211,36 @@ class QuickThoughtModel(object):
       accs.append(tf.reduce_mean(acc))
 
     loss = tf.reduce_mean(losses)
+    return accs, loss
+
+  def forward_context(self, inputs, masks, batch_size):
+    encode_in_emb = tf.nn.embedding_lookup(self.word_in_emb, inputs)
+    thought_in_vectors = self.encode(encode_in_emb, masks,
+                                     self.in_cells, self.proj_in)
+    encode_out_emb = tf.nn.embedding_lookup(self.word_out_emb, inputs)
+    thought_out_vectors = self.encode(encode_out_emb, masks,
+                                      self.out_cells, self.proj_out)
+    self.thought_vector = thought_in_vectors
+    logits = tf.matmul(thought_in_vectors, thought_out_vectors,
+                       transpose_b=True)
+    # Ignore source sentence
+    logits = tf.matrix_set_diag(logits, np.zeros(batch_size))
+    # Targets
+    targets_np = np.zeros((batch_size, batch_size))
+    ctxt_sent_pos = range(-self.context_size, self.context_size + 1)
+    ctxt_sent_pos.remove(0)
+    for ctxt_pos in ctxt_sent_pos:
+      targets_np += np.eye(batch_size, k=ctxt_pos)
+
+    targets_np_sum = np.sum(targets_np, axis=1, keepdims=True)
+    targets_np = targets_np / targets_np_sum
+    targets = tf.constant(targets_np, dtype=tf.float32)
+
+    # Forward and backward scores
+    losses = tf.nn.softmax_cross_entropy_with_logits(
+      labels=targets, logits=logits)
+    loss = tf.reduce_mean(losses)
+    accs = self.eval_acc(logits)
     return accs, loss
 
   @staticmethod

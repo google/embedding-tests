@@ -23,7 +23,8 @@ import os
 
 from data.bookcorpus import build_vocabulary
 from data.common import MODEL_DIR
-from thought import eval_trec, eval_msrp
+
+from thought.eval import eval_trec, eval_msrp, eval_classification
 from thought.vocabulary_expansion import expand_vocabulary
 from thought.quick_thought_model import QuickThoughtModel
 from utils.sent_utils import group_texts_by_len
@@ -37,15 +38,17 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 flags.DEFINE_integer('emb_dim', 620, 'embedding dimension')
 flags.DEFINE_integer('encoder_dim', 1200, 'encoder dim')
 flags.DEFINE_integer('context_size', 1, 'Context size')
-flags.DEFINE_integer('batch_size', 500, 'Batch size')
+flags.DEFINE_integer('batch_size', 800, 'Batch size')
 flags.DEFINE_integer('epoch', 0, 'Epochs of training')
 flags.DEFINE_integer('num_layer', 3, 'Number of transformer layer')
 flags.DEFINE_string('cell_type', 'LSTM', 'Encoder model')
-flags.DEFINE_string('eval_data', 'trec', 'eval dataset')
-flags.DEFINE_string('save_dir', MODEL_DIR,
+flags.DEFINE_string('save_dir', os.path.join(MODEL_DIR, 's2v'),
                     'Model directory for embedding model')
+flags.DEFINE_string('attr', 'author', 'Attributes to censor')
 flags.DEFINE_float('gamma', 0., 'Loss ratio for adversarial')
 flags.DEFINE_boolean('scratch', False, 'Train word embedding from scratch')
+flags.DEFINE_boolean('context', False, 'Negative examples from context or '
+                                       'random')
 
 FLAGS = flags.FLAGS
 
@@ -53,7 +56,8 @@ FLAGS = flags.FLAGS
 class QuickThoughtEncoder(object):
   def __init__(self, model_path, vocab, emb_dim, encoder_dim, context_size,
                cell_type, num_layer=2):
-    vocab, init_word_emb = expand_vocabulary(model_path, vocab)
+    vocab, init_word_emb_in = expand_vocabulary(model_path, vocab, "emb_in")
+
     self.model_path = model_path
     self.vocab = vocab
     vocab_size = len(vocab) + 1
@@ -65,16 +69,21 @@ class QuickThoughtEncoder(object):
 
     self.inputs = tf.placeholder(tf.int64, (None, None), name='inputs')
     self.masks = tf.placeholder(tf.int32, (None, None), name='masks')
-    encode_in_emb = tf.nn.embedding_lookup(self.model.word_in_emb, self.inputs)
-    self.encoded = self.model.encode(encode_in_emb, self.masks,
-                                     self.model.in_cells, self.model.proj_in)
+
+    encode_emb_a = tf.nn.embedding_lookup(self.model.word_in_emb, self.inputs)
+    encoded_a = self.model.encode(encode_emb_a, self.masks,
+                                  self.model.in_cells, self.model.proj_in)
+    encoded_norm_a = tf.nn.l2_normalize(encoded_a, axis=-1)
+    self.encoded = encoded_a
+    self.encoded_norm = encoded_norm_a
+
     self.sess = tf.Session()
     self.sess.run(tf.global_variables_initializer())
+
     # assign expanded embedding
     emb_plhdr = tf.placeholder(tf.float32, shape=(vocab_size, emb_dim))
     self.sess.run(self.model.word_in_emb.assign(emb_plhdr),
-                  {emb_plhdr: init_word_emb})
-
+                  {emb_plhdr: init_word_emb_in})
     var_list = {v.name[:-2]: v
                 for v in tf.global_variables() if not v.name.startswith('emb')}
     self.saver = tf.train.Saver(var_list)
@@ -90,7 +99,7 @@ class QuickThoughtEncoder(object):
       data.append(np.asarray(sent, dtype=np.int))
     return data
 
-  def encode(self, texts, verbose=True):
+  def encode(self, texts, verbose=True, norm=False):
     data = self.preprocess_data(texts)
     feats = []
     batches, batch_indices = group_texts_by_len(data)
@@ -102,7 +111,8 @@ class QuickThoughtEncoder(object):
       indices += batch_indices[i]
       masks = np.ones_like(inputs).astype(np.int32)
       feed = {self.inputs: inputs, self.masks: masks}
-      feat = self.sess.run(self.encoded, feed_dict=feed)
+      fetch = self.encoded_norm if norm else self.encoded
+      feat = self.sess.run(fetch, feed_dict=feed)
       feats.append(feat)
 
     assert len(indices) == len(data)
@@ -112,7 +122,7 @@ class QuickThoughtEncoder(object):
     return results
 
 
-def main(unused_argv):
+def main(_):
   vocab = build_vocabulary(0, rebuild=False)
   model_type = FLAGS.cell_type
   if model_type == 'TRANS':
@@ -123,9 +133,11 @@ def main(unused_argv):
         FLAGS.epoch, model_type, FLAGS.batch_size)
     if FLAGS.scratch:
       model_name += '_scratch'
+    if FLAGS.context:
+      model_name += '_context'
   else:
-    model_name = 'bookcorpus_e{}_{}_b{}_adv{}'.format(
-        FLAGS.epoch, model_type, FLAGS.batch_size, FLAGS.gamma)
+    model_name = 'bookcorpus_e{}_{}_b{}_{}_adv{}'.format(
+        FLAGS.epoch, model_type, FLAGS.batch_size, FLAGS.attr, FLAGS.gamma)
   model_path = os.path.join(FLAGS.save_dir, model_name)
 
   encoder = QuickThoughtEncoder(model_path, vocab, FLAGS.emb_dim,
@@ -133,10 +145,22 @@ def main(unused_argv):
                                 FLAGS.cell_type, num_layer=FLAGS.num_layer)
   encoder.load_weights()
 
-  if FLAGS.eval_data == 'trec':
-    eval_trec.evaluate(encoder)
-  if FLAGS.eval_data == 'msrp':
-    eval_msrp.evaluate(encoder)
+  all_scores = dict()
+
+  all_scores['MSRP'] = eval_msrp.evaluate(encoder)[1]
+  all_scores['TREC'] = eval_trec.evaluate(encoder)
+
+  for dataset in ['SUBJ', 'MPQA']:
+    all_scores[dataset] = eval_classification.eval_nested_kfold(encoder,
+                                                                dataset)
+
+  result_path = './downstream_result/'
+  if not os.path.exists(result_path):
+    os.makedirs(result_path)
+
+  with open(os.path.join(result_path, model_name), 'w') as f:
+    for k, v in all_scores.items():
+      f.write('{}: {}\n'.format(k, v))
 
 
 if __name__ == '__main__':

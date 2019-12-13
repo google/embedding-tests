@@ -16,21 +16,22 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-import os
-import time
-from collections import Counter
-
-import smart_open
-import tensorflow as tf
-from absl import app
 from absl import flags
-from privacy.analysis.rdp_accountant import compute_rdp, get_privacy_spent
+from absl import app
 
-from data.common import MODEL_DIR
-from data.wiki9 import read_wiki9_train_split
+import tensorflow as tf
+import numpy as np
+import time
+import smart_open
+import os
+
 from dp_optimizer.dp_optimizer_sparse import SparseDPAdamGaussianOptimizer
-from utils.common_utils import rigid_op_sequence, log
+from privacy.analysis.rdp_accountant import compute_rdp, get_privacy_spent
+from utils.common_utils import rigid_op_sequence
+from data.wiki9 import read_wiki9_train_split
+from data.common import MODEL_DIR
+from utils.common_utils import log
+from collections import Counter
 
 flags.DEFINE_float('learning_rate', 0.001, 'Learning rate for training')
 flags.DEFINE_float('noise_multiplier', 0.5,
@@ -119,8 +120,8 @@ def preprocess_texts(exp_id=0, sample=1e-4):
   for word in vocab_to_int:
     v = word_counts[word]
     threshold_count = sample * retain_total
-    word_probability = (np.sqrt(v / threshold_count) + 1)\
-                       * (threshold_count / v)
+    word_probability = (np.sqrt(v / threshold_count) + 1) \
+        * (threshold_count / v)
     word_probability = min(word_probability, 1.0)
     word_sample_int[vocab_to_int[word]] = int(round(word_probability * 2**32))
 
@@ -139,14 +140,13 @@ def make_parallel(fn, optimizer, num_gpus, **kwargs):
     with tf.device(tf.DeviceSpec(device_type="GPU", device_index=i)):
       with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
         out_grads, loss = fn(**{k: v[i] for k, v in in_splits.items()})
-        # out_split.append(fn(**{k: v[i] for k, v in in_splits.items()}))
         tower_grads.append((lambda: optimizer.apply_gradients(out_grads)))
         tower_losses.append(loss)
 
   return tower_grads, tf.reduce_mean(tower_losses)
 
 
-def main(unused_argv):
+def main(_):
   assert FLAGS.dpsgd
   exp_id = FLAGS.exp_id
   num_gpu = FLAGS.num_gpu

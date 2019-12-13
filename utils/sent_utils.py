@@ -28,14 +28,15 @@ def count_rareness(train_sents, train_masks, test_sents, test_masks,
                    percentile=75, verbose=False):
   train_sents = np.vstack(train_sents)
   train_masks = np.vstack(train_masks)
-  train_rs = np.sum(train_sents, axis=1) / np.sum(train_masks, axis=1)
-
   test_sents = np.vstack(test_sents)
   test_masks = np.vstack(test_masks)
+
+  train_rs = np.sum(train_sents, axis=1) / np.sum(train_masks, axis=1)
   test_rs = np.sum(test_sents, axis=1) / np.sum(test_masks, axis=1)
   if verbose:
     print(np.mean(train_rs), np.mean(test_rs))
     print(np.median(train_rs), np.median(test_rs))
+
   return np.percentile(train_rs, percentile)
 
 
@@ -187,8 +188,9 @@ def get_similarity_metric(x, y, metric, rtn_loss=False):
     sim = tf.reduce_sum(tf.multiply(x, y), axis=1)
     loss = -sim
   elif metric == 'l2':
+    # sim = -tf.reduce_sum(tf.square(x - y), axis=-1)
     sim = -tf.sqrt(tf.reduce_sum(tf.square(x - y), axis=-1))
-    loss = -sim
+    loss = -sim   # / tf.reduce_sum(tf.square(y), axis=-1, keepdims=True)
   else:
     raise ValueError('No such metric', metric)
   return loss if rtn_loss else sim
